@@ -31,7 +31,7 @@ import com.google.common.cache.CacheBuilder
 
 import org.apache.spark.{MapOutputTrackerMaster, SparkConf}
 import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.internal.{Logging, config}
 import org.apache.spark.network.shuffle.{ExternalBlockStoreClient, RemoteBlockPushResolver}
 import org.apache.spark.rpc.{IsolatedThreadSafeRpcEndpoint, RpcCallContext, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler._
@@ -57,6 +57,7 @@ class BlockManagerMasterEndpoint(
     isDriver: Boolean)
   extends IsolatedThreadSafeRpcEndpoint with Logging {
 
+  private val testing: Boolean = conf.get(config.Tests.IS_TESTING).getOrElse(false)
   // Mapping from executor id to the block manager's local disk directories.
   private val executorIdToLocalDirs =
     CacheBuilder
@@ -321,20 +322,6 @@ class BlockManagerMasterEndpoint(
   }
 
   private def removeShuffle(shuffleId: Int): Future[Seq[Boolean]] = {
-    val mergerLocations =
-      if (Utils.isPushBasedShuffleEnabled(conf, isDriver)) {
-        mapOutputTracker.getShufflePushMergerLocations(shuffleId)
-      } else {
-        Seq.empty[BlockManagerId]
-      }
-    val removeMsg = RemoveShuffle(shuffleId)
-    val removeShuffleFromExecutorsFutures = blockManagerInfo.values.map { bm =>
-      bm.storageEndpoint.ask[Boolean](removeMsg).recover {
-        // use false as default value means no shuffle data were removed
-        handleBlockRemovalFailure("shuffle", shuffleId.toString, bm.blockManagerId, false)
-      }
-    }.toSeq
-
     // Find all shuffle blocks on executors that are no longer running
     val blocksToDeleteByShuffleService =
       new mutable.HashMap[BlockManagerId, mutable.HashSet[BlockId]]
@@ -374,6 +361,14 @@ class BlockManagerMasterEndpoint(
 
     val removeShuffleMergeFromShuffleServicesFutures =
       externalBlockStoreClient.map { shuffleClient =>
+        val mergerLocations = {
+          if (Utils.isPushBasedShuffleEnabled(conf, isDriver)) {
+            mapOutputTracker.getShufflePushMergerLocations(shuffleId)
+          } else {
+            Seq.empty[BlockManagerId]
+          }
+        }
+        logInfo("mergerLocations= " + mergerLocations)
         mergerLocations.map { bmId =>
           Future[Boolean] {
             shuffleClient.removeShuffleMerge(bmId.host, bmId.port, shuffleId,
@@ -381,6 +376,17 @@ class BlockManagerMasterEndpoint(
           }
         }
       }.getOrElse(Seq.empty)
+
+    val removeMsg = RemoveShuffle(shuffleId)
+    val removeShuffleFromExecutorsFutures = blockManagerInfo.values.map { bm =>
+      bm.storageEndpoint.ask[Boolean](removeMsg).recover {
+        // use false as default value means no shuffle data were removed
+        handleBlockRemovalFailure("shuffle", shuffleId.toString, bm.blockManagerId, false)
+      }
+    }.toSeq
+    if (testing) {
+      RpcUtils.INFINITE_TIMEOUT.awaitResult(Future.sequence(removeShuffleFromExecutorsFutures))
+    }
 
     Future.sequence(removeShuffleFromExecutorsFutures ++
       removeShuffleFromShuffleServicesFutures ++
