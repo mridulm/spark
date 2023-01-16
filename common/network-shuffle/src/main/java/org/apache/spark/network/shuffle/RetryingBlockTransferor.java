@@ -87,7 +87,15 @@ public class RetryingBlockTransferor {
   /** Number of times we've attempted to retry so far. */
   private int retryCount = 0;
 
-  private boolean saslTimeoutSeen;
+  // Number of times SASL has been retried without success.
+  // If we see maxRetries consecutive SASL failures, the request is failed.
+  // On other hand, if sasl succeeds and we are able to send other requests subsequently,
+  // we reduce the SASL failures from retryCount (since SASL failures are part of
+  // connection bootstrap - which ended up being successful).
+  // spark.network.auth.rpcTimeout is much lower than spark.network.timeout and others - and so
+  // more susceptible to failures when remote service (like external shuffle service)
+  // is under load.
+  private int saslRetryCount = 0;
 
   /**
    * Set of all block ids which have not been transferred successfully or with a non-IO Exception.
@@ -123,7 +131,7 @@ public class RetryingBlockTransferor {
     this.currentListener = new RetryingBlockTransferListener();
     this.errorHandler = errorHandler;
     this.enableSaslRetries = conf.enableSaslRetries();
-    this.saslTimeoutSeen = false;
+    this.saslRetryCount = 0;
   }
 
   public RetryingBlockTransferor(
@@ -203,15 +211,15 @@ public class RetryingBlockTransferor {
     boolean isIOException = e instanceof IOException
       || e.getCause() instanceof IOException;
     boolean isSaslTimeout = enableSaslRetries && e instanceof SaslTimeoutException;
-    if (!isSaslTimeout && saslTimeoutSeen) {
-      retryCount = 0;
-      saslTimeoutSeen = false;
+    if (!isSaslTimeout && saslRetryCount > 0) {
+      retryCount -= Math.min(saslRetryCount, retryCount);
+      saslRetryCount = 0;
     }
     boolean hasRemainingRetries = retryCount < maxRetries;
     boolean shouldRetry =  (isSaslTimeout || isIOException) &&
         hasRemainingRetries && errorHandler.shouldRetryError(e);
     if (shouldRetry && isSaslTimeout) {
-      this.saslTimeoutSeen = true;
+      this.saslRetryCount ++;
     }
     return shouldRetry;
   }
@@ -236,9 +244,9 @@ public class RetryingBlockTransferor {
         if (this == currentListener && outstandingBlocksIds.contains(blockId)) {
           outstandingBlocksIds.remove(blockId);
           shouldForwardSuccess = true;
-          if (saslTimeoutSeen) {
-            retryCount = 0;
-            saslTimeoutSeen = false;
+          if (saslRetryCount > 0) {
+            retryCount -= Math.min(saslRetryCount, retryCount);
+            saslRetryCount = 0;
           }
         }
       }

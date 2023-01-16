@@ -58,10 +58,12 @@ public class RetryingBlockTransferorSuite {
   private static Map<String, String> configMap;
   private static RetryingBlockTransferor _retryingBlockTransferor;
 
+  private static final int MAX_RETRIES = 2;
+
   @Before
   public void initMap() {
     configMap = new HashMap<String, String>() {{
-      put("spark.shuffle.io.maxRetries", "2");
+      put("spark.shuffle.io.maxRetries", Integer.toString(MAX_RETRIES));
       put("spark.shuffle.io.retryWait", "0");
     }};
   }
@@ -309,7 +311,7 @@ public class RetryingBlockTransferorSuite {
     verify(listener, timeout(5000)).onBlockTransferFailure("b0", saslTimeoutException);
     verify(listener, times(3)).getTransferType();
     verifyNoMoreInteractions(listener);
-    assert(_retryingBlockTransferor.getRetryCount() == 2);
+    assert(_retryingBlockTransferor.getRetryCount() == MAX_RETRIES);
   }
 
   @Test
@@ -339,6 +341,31 @@ public class RetryingBlockTransferorSuite {
     // retryCount should be set back to 0. Then after that b1 encounters an
     // exception that is retried.
     assert(_retryingBlockTransferor.getRetryCount() == 1);
+  }
+
+  @Test
+  public void testIOExceptionFailsConnectionEvenWithSaslException() throws IOException, InterruptedException {
+    BlockFetchingListener listener = mock(BlockFetchingListener.class);
+
+    SaslTimeoutException saslException = new SaslTimeoutException(new TimeoutException());
+    IOException ioException = new IOException();
+    List<? extends Map<String, Object>> interactions = Arrays.asList(
+            ImmutableMap.of("b0", saslException),
+            ImmutableMap.of("b0", ioException),
+            ImmutableMap.of("b0", saslException),
+            ImmutableMap.of("b0", ioException),
+            ImmutableMap.of("b0", saslException),
+            // will not get invoked
+            ImmutableMap.of("b0", ioException),
+            // will not get invoked
+            ImmutableMap.of("b0", block0)
+    );
+    configMap.put("spark.shuffle.sasl.enableRetries", "true");
+    performInteractions(interactions, listener);
+    verify(listener, timeout(5000)).onBlockTransferFailure("b0", saslException);
+    verify(listener, atLeastOnce()).getTransferType();
+    verifyNoMoreInteractions(listener);
+    assert(_retryingBlockTransferor.getRetryCount() == MAX_RETRIES);
   }
 
   /**
