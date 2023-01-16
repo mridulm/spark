@@ -211,6 +211,8 @@ public class RetryingBlockTransferor {
     boolean isIOException = e instanceof IOException
       || e.getCause() instanceof IOException;
     boolean isSaslTimeout = enableSaslRetries && e instanceof SaslTimeoutException;
+    // If this is a non SASL request failure, reduce earlier SASL failures from retryCount
+    // since some subsequent SASL attempt was successful
     if (!isSaslTimeout && saslRetryCount > 0) {
       retryCount -= Math.min(saslRetryCount, retryCount);
       saslRetryCount = 0;
@@ -244,6 +246,8 @@ public class RetryingBlockTransferor {
         if (this == currentListener && outstandingBlocksIds.contains(blockId)) {
           outstandingBlocksIds.remove(blockId);
           shouldForwardSuccess = true;
+          // If there were SASL failures earlier, remove them from retryCount, as there was
+          // a SASL success (and some other request post bootstrap was also successful).
           if (saslRetryCount > 0) {
             retryCount -= Math.min(saslRetryCount, retryCount);
             saslRetryCount = 0;
