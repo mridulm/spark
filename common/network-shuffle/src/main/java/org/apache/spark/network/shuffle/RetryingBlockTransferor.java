@@ -132,7 +132,6 @@ public class RetryingBlockTransferor {
     this.currentListener = new RetryingBlockTransferListener();
     this.errorHandler = errorHandler;
     this.enableSaslRetries = conf.enableSaslRetries();
-    this.saslRetryCount = 0;
   }
 
   public RetryingBlockTransferor(
