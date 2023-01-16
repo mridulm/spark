@@ -88,13 +88,14 @@ public class RetryingBlockTransferor {
   private int retryCount = 0;
 
   // Number of times SASL has been retried without success.
-  // If we see maxRetries consecutive SASL failures, the request is failed.
+  // If we see maxRetries consecutive failures, the request is failed.
   // On other hand, if sasl succeeds and we are able to send other requests subsequently,
   // we reduce the SASL failures from retryCount (since SASL failures are part of
   // connection bootstrap - which ended up being successful).
-  // spark.network.auth.rpcTimeout is much lower than spark.network.timeout and others - and so
-  // more susceptible to failures when remote service (like external shuffle service)
-  // is under load.
+  // spark.network.auth.rpcTimeout is much lower than spark.network.timeout and others -
+  // and so sasl is more susceptible to failures when remote service
+  // (like external shuffle service) is under load: but once it succeeds, we do not want to
+  // include it as part of request retries.
   private int saslRetryCount = 0;
 
   /**
