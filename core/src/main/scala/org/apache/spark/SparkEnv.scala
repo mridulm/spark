@@ -25,6 +25,7 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.util.Properties
 
+import com.google.common.base.Preconditions
 import com.google.common.cache.CacheBuilder
 import org.apache.hadoop.conf.Configuration
 
@@ -62,7 +63,6 @@ class SparkEnv (
     val closureSerializer: Serializer,
     val serializerManager: SerializerManager,
     val mapOutputTracker: MapOutputTracker,
-    val shuffleManager: ShuffleManager,
     val broadcastManager: BroadcastManager,
     val blockManager: BlockManager,
     val securityManager: SecurityManager,
@@ -70,6 +70,12 @@ class SparkEnv (
     val memoryManager: MemoryManager,
     val outputCommitCoordinator: OutputCommitCoordinator,
     val conf: SparkConf) extends Logging {
+
+  // We initialize the ShuffleManager later, in SparkContext and Executor, to allow
+  // user jars to define custom ShuffleManagers.
+  private var _shuffleManager: ShuffleManager = _
+
+  def shuffleManager: ShuffleManager = _shuffleManager
 
   @volatile private[spark] var isStopped = false
 
@@ -99,7 +105,9 @@ class SparkEnv (
       isStopped = true
       pythonWorkers.values.foreach(_.stop())
       mapOutputTracker.stop()
-      shuffleManager.stop()
+      if (shuffleManager != null) {
+        shuffleManager.stop()
+      }
       broadcastManager.stop()
       blockManager.stop()
       blockManager.master.stop()
@@ -184,6 +192,14 @@ class SparkEnv (
       worker: PythonWorker): Unit = {
     releasePythonWorker(
       pythonExec, workerModule, PythonWorkerFactory.defaultDaemonModule, envVars, worker)
+  }
+
+  private[spark] def initiailzeShuffleManager(): Unit = {
+    Preconditions.checkState(null == _shuffleManager, "Shuffle manager already initialized")
+    // Must not be driver
+    Preconditions.checkState(executorId != SparkContext.DRIVER_IDENTIFIER,
+      "Should not be called in driver")
+    _shuffleManager = ShuffleManager.create(conf, isDriver = false)
   }
 }
 
@@ -355,16 +371,7 @@ object SparkEnv extends Logging {
       new MapOutputTrackerMasterEndpoint(
         rpcEnv, mapOutputTracker.asInstanceOf[MapOutputTrackerMaster], conf))
 
-    // Let the user specify short names for shuffle managers
-    val shortShuffleMgrNames = Map(
-      "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
-      "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName)
-    val shuffleMgrName = conf.get(config.SHUFFLE_MANAGER)
-    val shuffleMgrClass =
-      shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
-    val shuffleManager = Utils.instantiateSerializerOrShuffleManager[ShuffleManager](
-      shuffleMgrClass, conf, isDriver)
-
+    val shuffleManager: ShuffleManager = if (isDriver) ShuffleManager.create(conf, true) else null
     val memoryManager: MemoryManager = UnifiedMemoryManager(conf, numUsableCores)
 
     val blockManagerPort = if (isDriver) {
@@ -415,6 +422,10 @@ object SparkEnv extends Logging {
         advertiseAddress, blockManagerPort, numUsableCores, blockManagerMaster.driverEndpoint)
 
     // NB: blockManager is not valid until initialize() is called later.
+    //     SPARK-45762 introduces a change where the ShuffleManager is initialized later
+    //     in the SparkContext and Executor, to allow for custom ShuffleManagers defined
+    //     in user jars. After initialize(), the `BlockManager`'s shuffleManager reference
+    //     isn't set yet. It is only available after `BlockManager.setShuffleManager` is invoked.
     val blockManager = new BlockManager(
       executorId,
       rpcEnv,
@@ -462,7 +473,6 @@ object SparkEnv extends Logging {
       closureSerializer,
       serializerManager,
       mapOutputTracker,
-      shuffleManager,
       broadcastManager,
       blockManager,
       securityManager,
@@ -477,6 +487,7 @@ object SparkEnv extends Logging {
     if (isDriver) {
       val sparkFilesDir = Utils.createTempDir(Utils.getLocalDir(conf), "userFiles").getAbsolutePath
       envInstance.driverTmpDir = Some(sparkFilesDir)
+      envInstance._shuffleManager = shuffleManager
     }
 
     envInstance

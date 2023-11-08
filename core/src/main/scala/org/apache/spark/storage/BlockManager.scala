@@ -186,11 +186,15 @@ private[spark] class BlockManager(
     val conf: SparkConf,
     memoryManager: MemoryManager,
     mapOutputTracker: MapOutputTracker,
-    shuffleManager: ShuffleManager,
+    private val _shuffleManager: ShuffleManager,
     val blockTransferService: BlockTransferService,
     securityManager: SecurityManager,
     externalBlockStoreClient: Option[ExternalBlockStoreClient])
   extends BlockDataManager with BlockEvictionHandler with Logging {
+
+  // We initialize the ShuffleManager later, in SparkContext and Executor, to allow
+  // user jars to define custom ShuffleManagers.
+  private lazy val shuffleManager = Option(_shuffleManager).getOrElse(SparkEnv.get.shuffleManager)
 
   // same as `conf.get(config.SHUFFLE_SERVICE_ENABLED)`
   private[spark] val externalShuffleServiceEnabled: Boolean = externalBlockStoreClient.isDefined
