@@ -50,7 +50,7 @@ import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.scheduler._
 import org.apache.spark.serializer.SerializerHelper
-import org.apache.spark.shuffle.{FetchFailedException, ShuffleBlockPusher, ShuffleManager}
+import org.apache.spark.shuffle.{FetchFailedException, ShuffleBlockPusher}
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
 import org.apache.spark.util._
@@ -337,8 +337,11 @@ private[spark] class Executor(
       PluginContainer(env, resources.asJava)
     }
 
-  Utils.withContextClassLoader(defaultSessionState.replClassLoader) {
-    env.initiailzeShuffleManager()
+  // Already initialized in local mode
+  if (!isLocal) {
+    Utils.withContextClassLoader(defaultSessionState.replClassLoader) {
+      env.initiailzeShuffleManager()
+    }
   }
 
   metricsPoller.start()

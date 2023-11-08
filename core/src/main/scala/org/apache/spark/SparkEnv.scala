@@ -18,7 +18,6 @@
 package org.apache.spark
 
 import java.io.File
-import java.util.Locale
 
 import scala.collection.concurrent
 import scala.collection.mutable
@@ -195,11 +194,9 @@ class SparkEnv (
   }
 
   private[spark] def initiailzeShuffleManager(): Unit = {
-    Preconditions.checkState(null == _shuffleManager, "Shuffle manager already initialized")
-    // Must not be driver
-    Preconditions.checkState(executorId != SparkContext.DRIVER_IDENTIFIER,
-      "Should not be called in driver")
-    _shuffleManager = ShuffleManager.create(conf, isDriver = false)
+    Preconditions.checkState(null == _shuffleManager,
+      "Shuffle manager already initialized to %s", _shuffleManager)
+    _shuffleManager = ShuffleManager.create(conf, executorId == SparkContext.DRIVER_IDENTIFIER)
   }
 }
 
@@ -371,7 +368,8 @@ object SparkEnv extends Logging {
       new MapOutputTrackerMasterEndpoint(
         rpcEnv, mapOutputTracker.asInstanceOf[MapOutputTrackerMaster], conf))
 
-    val shuffleManager: ShuffleManager = if (isDriver) ShuffleManager.create(conf, true) else null
+    // val shuffleManager: ShuffleManager = if (isDriver) ShuffleManager.create(conf, true) else null
+    val shuffleManager: ShuffleManager = null
     val memoryManager: MemoryManager = UnifiedMemoryManager(conf, numUsableCores)
 
     val blockManagerPort = if (isDriver) {
