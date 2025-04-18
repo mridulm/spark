@@ -274,10 +274,12 @@ private class ShuffleStatus(
    * Removes all shuffle outputs associated with this host. Note that this will also remove
    * outputs which are served by an external shuffle server (if one exists).
    */
-  def removeOutputsOnHost(host: String): Unit = withWriteLock {
+  def removeOutputsOnHost(host: String): Boolean = withWriteLock {
     logDebug(s"Removing outputs for host ${host}")
-    removeOutputsByFilter(x => x.host == host)
+    val modified = removeOutputsByFilter(x => x.host == host)
+    // loss of merge data is recoverable
     removeMergeResultsByFilter(x => x.host == host)
+    modified
   }
 
   /**
@@ -285,7 +287,7 @@ private class ShuffleStatus(
    * remove outputs which are served by an external shuffle server (if one exists), as they are
    * still registered with that execId.
    */
-  def removeOutputsOnExecutor(execId: String): Unit = withWriteLock {
+  def removeOutputsOnExecutor(execId: String): Boolean = withWriteLock {
     logDebug(s"Removing outputs for execId ${execId}")
     removeOutputsByFilter(x => x.executorId == execId)
   }
@@ -293,8 +295,11 @@ private class ShuffleStatus(
   /**
    * Removes all shuffle outputs which satisfies the filter. Note that this will also
    * remove outputs which are served by an external shuffle server (if one exists).
+   * @return Was any shuffle output cleaned up
    */
-  def removeOutputsByFilter(f: BlockManagerId => Boolean): Unit = withWriteLock {
+  def removeOutputsByFilter(f: BlockManagerId => Boolean): Boolean = withWriteLock {
+
+    var updated = false
     for (mapIndex <- mapStatuses.indices) {
       val currentMapStatus = mapStatuses(mapIndex)
       if (currentMapStatus != null && f(currentMapStatus.location)) {
@@ -303,8 +308,11 @@ private class ShuffleStatus(
         mapStatusesDeleted(mapIndex) = currentMapStatus
         mapStatuses(mapIndex) = null
         invalidateSerializedMapOutputStatusCache()
+        updated = true
       }
     }
+
+    updated
   }
 
   /**
@@ -935,9 +943,10 @@ private[spark] class MapOutputTrackerMaster(
    * Removes all shuffle outputs associated with this host. Note that this will also remove
    * outputs which are served by an external shuffle server (if one exists).
    */
-  def removeOutputsOnHost(host: String): Unit = {
-    shuffleStatuses.valuesIterator.foreach { _.removeOutputsOnHost(host) }
+  def removeOutputsOnHost(host: String): Set[Int] = {
+    val updatedShuffleIds = shuffleStatuses.filter(_._2.removeOutputsOnHost(host)).keys.toSet
     incrementEpoch()
+    updatedShuffleIds
   }
 
   /**
@@ -945,9 +954,10 @@ private[spark] class MapOutputTrackerMaster(
    * outputs which are served by an external shuffle server (if one exists), as they are still
    * registered with this execId.
    */
-  def removeOutputsOnExecutor(execId: String): Unit = {
-    shuffleStatuses.valuesIterator.foreach { _.removeOutputsOnExecutor(execId) }
+  def removeOutputsOnExecutor(execId: String): Set[Int] = {
+    val updatedShuffleIds = shuffleStatuses.filter(_._2.removeOutputsOnExecutor(execId)).keys.toSet
     incrementEpoch()
+    updatedShuffleIds
   }
 
   /** Check if the given shuffle is being tracked */

@@ -2129,60 +2129,7 @@ private[spark] class DAGScheduler(
               // guaranteed to be determinate, so the input data of the reducers will not change
               // even if the map tasks are re-tried.
               if (mapStage.isIndeterminate) {
-                // It's a little tricky to find all the succeeding stages of `mapStage`, because
-                // each stage only know its parents not children. Here we traverse the stages from
-                // the leaf nodes (the result stages of active jobs), and rollback all the stages
-                // in the stage chains that connect to the `mapStage`. To speed up the stage
-                // traversing, we collect the stages to rollback first. If a stage needs to
-                // rollback, all its succeeding stages need to rollback to.
-                val stagesToRollback = HashSet[Stage](mapStage)
-
-                def collectStagesToRollback(stageChain: List[Stage]): Unit = {
-                  if (stagesToRollback.contains(stageChain.head)) {
-                    stageChain.drop(1).foreach(s => stagesToRollback += s)
-                  } else {
-                    stageChain.head.parents.foreach { s =>
-                      collectStagesToRollback(s :: stageChain)
-                    }
-                  }
-                }
-
-                def generateErrorMessage(stage: Stage): String = {
-                  "A shuffle map stage with indeterminate output was failed and retried. " +
-                    s"However, Spark cannot rollback the $stage to re-process the input data, " +
-                    "and has to fail this job. Please eliminate the indeterminacy by " +
-                    "checkpointing the RDD before repartition and try again."
-                }
-
-                activeJobs.foreach(job => collectStagesToRollback(job.finalStage :: Nil))
-
-                // The stages will be rolled back after checking
-                val rollingBackStages = HashSet[Stage](mapStage)
-                stagesToRollback.foreach {
-                  case mapStage: ShuffleMapStage =>
-                    val numMissingPartitions = mapStage.findMissingPartitions().length
-                    if (numMissingPartitions < mapStage.numTasks) {
-                      if (sc.conf.get(config.SHUFFLE_USE_OLD_FETCH_PROTOCOL)) {
-                        val reason = "A shuffle map stage with indeterminate output was failed " +
-                          "and retried. However, Spark can only do this while using the new " +
-                          "shuffle block fetching protocol. Please check the config " +
-                          "'spark.shuffle.useOldFetchProtocol', see more detail in " +
-                          "SPARK-27665 and SPARK-25341."
-                        abortStage(mapStage, reason, None)
-                      } else {
-                        rollingBackStages += mapStage
-                      }
-                    }
-
-                  case resultStage: ResultStage if resultStage.activeJob.isDefined =>
-                    val numMissingPartitions = resultStage.findMissingPartitions().length
-                    if (numMissingPartitions < resultStage.numTasks) {
-                      // TODO: support to rollback result tasks.
-                      abortStage(resultStage, generateErrorMessage(resultStage), None)
-                    }
-
-                  case _ =>
-                }
+                val rollingBackStages = abortIndeterminateStageChildren(mapStage)
                 logInfo(log"The shuffle map stage ${MDC(SHUFFLE_ID, mapStage)} with indeterminate output was failed, " +
                   log"we will roll back and rerun below stages which include itself and all its " +
                   log"indeterminate child stages: ${MDC(STAGES, rollingBackStages)}")
@@ -2344,6 +2291,76 @@ private[spark] class DAGScheduler(
         // Unrecognized failure - also do nothing. If the task fails repeatedly, the TaskScheduler
         // will abort the job.
     }
+  }
+
+  /**
+   * @param mapStage The indeterminate stage being recomputed
+   * @return (All jobs with map stage have been aborted, stages which will need to be rolled back)
+   */
+  private def abortIndeterminateStageChildren(mapStage: ShuffleMapStage):
+      (Boolean, HashSet[Stage]) = {
+
+    assert(mapStage.isIndeterminate)
+
+    // TODO: perhaps materialize this if we are going to compute it often enough ?
+    // It's a little tricky to find all the succeeding stages of `mapStage`, because
+    // each stage only know its parents not children. Here we traverse the stages from
+    // the leaf nodes (the result stages of active jobs), and rollback all the stages
+    // in the stage chains that connect to the `mapStage`. To speed up the stage
+    // traversing, we collect the stages to rollback first. If a stage needs to
+    // rollback, all its succeeding stages need to rollback to.
+    val stagesToRollback = HashSet[Stage](mapStage)
+
+    def collectStagesToRollback(stageChain: List[Stage]): Unit = {
+      if (stagesToRollback.contains(stageChain.head)) {
+        stageChain.drop(1).foreach(s => stagesToRollback += s)
+      } else {
+        stageChain.head.parents.foreach { s =>
+          collectStagesToRollback(s :: stageChain)
+        }
+      }
+    }
+
+    def generateErrorMessage(stage: Stage): String = {
+      "A shuffle map stage with indeterminate output was failed and retried. " +
+        s"However, Spark cannot rollback the $stage to re-process the input data, " +
+        "and has to fail this job. Please eliminate the indeterminacy by " +
+        "checkpointing the RDD before repartition and try again."
+    }
+
+    activeJobs.foreach(job => collectStagesToRollback(job.finalStage :: Nil))
+    val numJobsWithStage = activeJobs.count(job => stagesToRollback.contains(job.finalStage))
+
+    // The stages will be rolled back after checking
+    val rollingBackStages = HashSet[Stage](mapStage)
+    var numAbortedJobs = 0
+    stagesToRollback.foreach {
+      case mapStage: ShuffleMapStage =>
+        val numMissingPartitions = mapStage.findMissingPartitions().length
+        if (numMissingPartitions < mapStage.numTasks) {
+          if (sc.conf.get(config.SHUFFLE_USE_OLD_FETCH_PROTOCOL)) {
+            val reason = "A shuffle map stage with indeterminate output was failed " +
+              "and retried. However, Spark can only do this while using the new " +
+              "shuffle block fetching protocol. Please check the config " +
+              "'spark.shuffle.useOldFetchProtocol', see more detail in " +
+              "SPARK-27665 and SPARK-25341."
+            abortStage(mapStage, reason, None)
+          } else {
+            rollingBackStages += mapStage
+          }
+        }
+
+      case resultStage: ResultStage if resultStage.activeJob.isDefined =>
+        val numMissingPartitions = resultStage.findMissingPartitions().length
+        if (numMissingPartitions < resultStage.numTasks) {
+          // TODO: support to rollback result tasks.
+          abortStage(resultStage, generateErrorMessage(resultStage), None)
+          numAbortedJobs += 1
+        }
+
+      case _ =>
+    }
+    (numAbortedJobs >= numJobsWithStage, rollingBackStages)
   }
 
   /**
@@ -2746,14 +2763,20 @@ private[spark] class DAGScheduler(
           case Some(host) =>
             logInfo(log"Shuffle files lost for host: ${MDC(HOST, host)} (epoch " +
               log"${MDC(EPOCH, currentEpoch)}")
-            mapOutputTracker.removeOutputsOnHost(host)
+            abortStagesWithLostShuffleData(mapOutputTracker.removeOutputsOnHost(host))
           case None =>
               logInfo(log"Shuffle files lost for executor: ${MDC(EXECUTOR_ID, execId)} " +
                 log"(epoch ${MDC(EPOCH, currentEpoch)})")
-            mapOutputTracker.removeOutputsOnExecutor(execId)
+            abortStagesWithLostShuffleData(mapOutputTracker.removeOutputsOnExecutor(execId))
         }
       }
     }
+  }
+
+  private def abortStagesWithLostShuffleData(shuffleIds: Set[Int]): Unit = {
+    shuffleIds.flatMap(shuffleIdToMapStage.get).
+      filter(_.isIndeterminate).
+      foreach(abortIndeterminateStageChildren)
   }
 
   /**
@@ -2773,7 +2796,7 @@ private[spark] class DAGScheduler(
       message: String): Unit = {
     logInfo(log"Shuffle files lost for worker ${MDC(WORKER_ID, workerId)} " +
       log"on host ${MDC(HOST, host)}")
-    mapOutputTracker.removeOutputsOnHost(host)
+    abortStagesWithLostShuffleData(mapOutputTracker.removeOutputsOnHost(host))
     clearCacheLocs()
   }
 
