@@ -17,7 +17,7 @@
 
 package org.apache.spark.util
 
-import javax.annotation.concurrent.GuardedBy
+import java.util.concurrent.locks.{Lock, ReentrantReadWriteLock}
 
 /**
  * A special Thread that provides "runUninterruptibly" to allow running codes without being
@@ -35,22 +35,63 @@ private[spark] class UninterruptibleThread(
     this(null, name)
   }
 
-  /** A monitor to protect "uninterruptible" and "interrupted" */
-  private val uninterruptibleLock = new Object
+  private val (readLock, writeLock) = {
+    val lock = new ReentrantReadWriteLock()
+    (lock.readLock(), lock.writeLock())
+  }
+  private val allowUninterruptible = writeLock.newCondition()
 
   /**
    * Indicates if `this`  thread are in the uninterruptible status. If so, interrupting
    * "this" will be deferred until `this`  enters into the interruptible status.
    */
-  @GuardedBy("uninterruptibleLock")
   private var uninterruptible = false
 
   /**
    * Indicates if we should interrupt `this` when we are leaving the uninterruptible zone.
    */
-  @GuardedBy("uninterruptibleLock")
   private var shouldInterruptThread = false
 
+  /**
+   * Indicates that we should wait for interrupt() call before proceeding.
+   */
+  private var awaitInterruptThread = false
+
+  private def withLock[R](lock: Lock)(f: => R): R = {
+    lock.lock()
+    try {
+      f
+    } finally {
+      lock.unlock()
+    }
+  }
+
+  private def isUninterruptible(): Boolean = {
+    withLock(readLock) {
+      uninterruptible
+    }
+  }
+
+  private def setUnInterruptible(): Unit = {
+    withLock(writeLock) {
+      uninterruptible = true
+    }
+  }
+
+
+  private def waitForUninterruptible(): Unit = {
+    withLock(writeLock) {
+      while (true) {
+        shouldInterruptThread = Thread.interrupted() || shouldInterruptThread
+        if (shouldInterruptThread || !awaitInterruptThread) return
+        try {
+          allowUninterruptible.await()
+        } catch {
+          case _: InterruptedException => shouldInterruptThread = true
+        }
+      }
+    }
+  }
   /**
    * Run `f` uninterruptibly in `this` thread. The thread won't be interrupted before returning
    * from `f`.
@@ -63,20 +104,18 @@ private[spark] class UninterruptibleThread(
         s"Expected: $this but was ${Thread.currentThread()}")
     }
 
-    if (uninterruptibleLock.synchronized { uninterruptible }) {
+    if (isUninterruptible()) {
       // We are already in the uninterruptible status. So just run "f" and return
       return f
     }
 
-    uninterruptibleLock.synchronized {
-      // Clear the interrupted status if it's set.
-      shouldInterruptThread = Thread.interrupted() || shouldInterruptThread
-      uninterruptible = true
-    }
+    setUnInterruptible()
+    waitForUninterruptible()
+
     try {
       f
     } finally {
-      uninterruptibleLock.synchronized {
+      withLock(writeLock) {
         uninterruptible = false
         if (shouldInterruptThread) {
           // Recover the interrupted status
@@ -92,11 +131,33 @@ private[spark] class UninterruptibleThread(
    * interrupted until it enters into the interruptible status.
    */
   override def interrupt(): Unit = {
-    uninterruptibleLock.synchronized {
-      if (uninterruptible) {
-        shouldInterruptThread = true
-      } else {
+
+    def doThreadInterruption(): Boolean = {
+      withLock(writeLock) {
+        shouldInterruptThread = uninterruptible
+        // as we are releasing uninterruptibleLock before calling super.interrupt() there is a
+        // possibility that runUninterruptibly() would be called after lock is released but before
+        // super.interrupt() is called. In this case to prevent runUninterruptibly() from being
+        // interrupted, we use awaitInterruptThread flag. We need to set it only if
+        // runUninterruptibly() is not yet set uninterruptible to true (!shouldInterruptThread) and
+        // there is no other threads that called interrupt (awaitInterruptThread is already true)
+        if (!shouldInterruptThread && !awaitInterruptThread) {
+          awaitInterruptThread = true
+          true
+        } else {
+          false
+        }
+      }
+    }
+
+    if (doThreadInterruption()) {
+      try {
         super.interrupt()
+      } finally {
+        withLock(writeLock) {
+          awaitInterruptThread = false
+          allowUninterruptible.signalAll()
+        }
       }
     }
   }
