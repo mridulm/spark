@@ -76,14 +76,16 @@ private[spark] class UninterruptibleThread(
     try {
       f
     } finally {
+      var doInterrupt = false
       uninterruptibleLock.synchronized {
         uninterruptible = false
         if (shouldInterruptThread) {
           // Recover the interrupted status
-          super.interrupt()
+          doInterrupt = true
           shouldInterruptThread = false
         }
       }
+      if (doInterrupt) super.interrupt()
     }
   }
 
@@ -92,12 +94,19 @@ private[spark] class UninterruptibleThread(
    * interrupted until it enters into the interruptible status.
    */
   override def interrupt(): Unit = {
-    uninterruptibleLock.synchronized {
-      if (uninterruptible) {
-        shouldInterruptThread = true
-      } else {
-        super.interrupt()
+    val needInterrupt = {
+      uninterruptibleLock.synchronized {
+        if (uninterruptible) {
+          shouldInterruptThread = true
+          false
+        } else {
+          true
+        }
       }
+    }
+
+    if (needInterrupt) {
+      super.interrupt()
     }
   }
 }
